@@ -105,6 +105,11 @@ type cachedQueueReader struct {
 	logger  log.Logger
 	metrics metrics.Scope
 
+	// strategy encapsulates the scheduled window behavior and its background lifecycle: it is
+	// consulted at the three seams — Start/Stop, Inject's beyond-frontier branch, and putTasks
+	// reclaim. Set once at construction.
+	strategy windowStrategy
+
 	mu sync.RWMutex
 
 	// inclusiveLowerBound is the inclusive start of the cached window. Tasks
@@ -135,10 +140,6 @@ type cachedQueueReader struct {
 	// These tasks are drained into the cache after the prefetch extends the window.
 	pendingInjectBuffer []persistence.Task
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
-
 	// prefetchCh signals the prefetchLoop to recompute its timer. Buffered(1) so
 	// senders never block; duplicate signals are dropped, the loop reads current
 	// state on each wake.
@@ -164,7 +165,7 @@ func newCachedQueueReader(
 	metricsScope metrics.Scope,
 ) *cachedQueueReader {
 	config := shard.GetConfig()
-	return newCachedQueueReaderWithOptions(
+	return newCachedQueueReaderWithStrategy(
 		base,
 		queue,
 		shard,
@@ -182,10 +183,14 @@ func newCachedQueueReader(
 			PrefetchJitterCoefficient: config.TimerProcessorMaxPollIntervalJitterCoefficient,
 			ShadowSampleInterval:      config.TimerProcessorCachedQueueReaderShadowSampleInterval,
 		},
+		newScheduledStrategy,
 	)
 }
 
-func newCachedQueueReaderWithOptions(
+// newCachedQueueReaderWithStrategy builds the generic reader and attaches the window strategy the
+// factory produces. Used directly by tests to inject a strategy; production entry points
+// (newCachedQueueReader) wrap it with the scheduled strategy.
+func newCachedQueueReaderWithStrategy(
 	base QueueReader,
 	queue InMemQueue,
 	shard shard.Context,
@@ -193,9 +198,9 @@ func newCachedQueueReaderWithOptions(
 	logger log.Logger,
 	metricsScope metrics.Scope,
 	options *cachedQueueReaderOptions,
+	newStrategy func(*cachedQueueReader) windowStrategy,
 ) *cachedQueueReader {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &cachedQueueReader{
+	q := &cachedQueueReader{
 		status:              common.DaemonStatusInitialized,
 		base:                base,
 		shard:               shard,
@@ -208,9 +213,91 @@ func newCachedQueueReaderWithOptions(
 		exclusiveUpperBound: persistence.MinimumHistoryTaskKey,
 		prefetchCh:          make(chan struct{}, 1),
 		lastRangeID:         shard.GetRangeID(),
-		ctx:                 ctx,
-		cancel:              cancel,
 	}
+	q.strategy = newStrategy(q)
+	return q
+}
+
+// windowStrategy owns the behavior that differs between the scheduled (timer) and immediate
+// (transfer) cached readers at three seams — Start/Stop (background work), Inject's beyond-frontier
+// branch, and putTasks (capacity reclaim). The reader is a mode-agnostic caching engine (coverage
+// checks, GetTask serving, read-level + size-cap eviction, rangeID fencing, the shadow subsystem)
+// parameterized by one strategy, set once at construction. Each implementation holds a back-reference
+// to the reader it belongs to.
+type windowStrategy interface {
+	// start launches background work. scheduled: the prefetch loop. immediate: no-op.
+	start()
+	// stop cancels background work and waits for it to finish. scheduled: cancel + wg.Wait.
+	// immediate: no-op.
+	stop()
+	// onTaskBeyondFrontier disposes of a just-persisted task whose key is at or beyond
+	// exclusiveUpperBound (the caller has already filtered out taskID==0, covered tasks, and tasks
+	// below the lower bound) and returns the inject-status for metrics; the reader owns all
+	// counter/histogram emission, so timer metrics are unaffected.
+	//   scheduled: buffer (in-flight prefetch) -> buffered; otherwise -> dropped_upper
+	onTaskBeyondFrontier(t persistence.Task) (status string)
+	// reclaimForInsert makes room before inserting extra tasks.
+	// scheduled: time-based eviction. immediate: no-op.
+	reclaimForInsert(extra int)
+}
+
+var _ windowStrategy = (*scheduledStrategy)(nil)
+
+// scheduledStrategy implements the timer (scheduled) window behavior: a background prefetch loop
+// warms a look-ahead window with future-scheduled tasks, time-based eviction reclaims capacity, and
+// tasks beyond the frontier are buffered (during an in-flight prefetch) or dropped. It owns the
+// prefetch/eviction machinery and the background goroutine's lifecycle (ctx/cancel/wg), operating on
+// the reader's shared window state via its back-reference.
+type scheduledStrategy struct {
+	r      *cachedQueueReader
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+}
+
+func newScheduledStrategy(r *cachedQueueReader) windowStrategy {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &scheduledStrategy{r: r, ctx: ctx, cancel: cancel}
+}
+
+// start launches the background prefetch loop.
+func (s *scheduledStrategy) start() {
+	s.wg.Add(1)
+	go s.prefetchLoop()
+}
+
+// stop cancels the prefetch loop and waits for it to finish.
+func (s *scheduledStrategy) stop() {
+	s.cancel()
+	s.wg.Wait()
+}
+
+// reclaimForInsert evicts tasks older than TimeEvictionWindow if the insert would exceed MaxSize.
+func (s *scheduledStrategy) reclaimForInsert(extra int) {
+	s.tryTimeEvict(extra)
+}
+
+// onTaskBeyondFrontier buffers a task that arrived during an in-flight prefetch (so it is not lost
+// when the window later extends past it) or drops it otherwise. Caller holds q.mu.
+func (s *scheduledStrategy) onTaskBeyondFrontier(t persistence.Task) string {
+	q := s.r
+	if s.isToBufferTask(t.GetTaskKey()) {
+		if q.logger.DebugOn() {
+			q.logger.Debug("buffering task",
+				tag.Dynamic("taskKey", t.GetTaskKey()),
+				tag.Dynamic("cacheState", q.getState()),
+			)
+		}
+		q.pendingInjectBuffer = append(q.pendingInjectBuffer, t)
+		return injectStatusBuffered
+	}
+	if q.logger.DebugOn() {
+		q.logger.Debug("task key is beyond the upper/target prefetch bound, dropping task",
+			tag.Dynamic("taskKey", t.GetTaskKey()),
+			tag.Dynamic("cacheState", q.getState()),
+		)
+	}
+	return injectStatusDroppedUpper
 }
 
 // Start anchors the initial eviction window and launches the background loops.
@@ -219,8 +306,7 @@ func (q *cachedQueueReader) Start() {
 		return
 	}
 	q.logger.Info("Cached Queue Reader state changed", tag.LifeCycleStarting)
-	q.wg.Add(1)
-	go q.prefetchLoop()
+	q.strategy.start()
 }
 
 // Stop cancels background goroutines and waits for them to finish.
@@ -229,16 +315,16 @@ func (q *cachedQueueReader) Stop() {
 		return
 	}
 	q.logger.Info("Cached Queue Reader state changed", tag.LifeCycleStopping)
-	q.cancel()
-	q.wg.Wait()
+	q.strategy.stop()
 	q.logger.Info("Cached Queue Reader state changed", tag.LifeCycleStopped)
 }
 
 // prefetchLoop fetches tasks into the look-ahead window on a timer. It fires
 // shortly after Start, then re-arms based on the result or when the upper
 // bound changes via notifyPrefetch.
-func (q *cachedQueueReader) prefetchLoop() {
-	defer q.wg.Done()
+func (s *scheduledStrategy) prefetchLoop() {
+	q := s.r
+	defer s.wg.Done()
 
 	timer := q.clock.NewTimer(time.Millisecond)
 	defer timer.Stop()
@@ -247,18 +333,18 @@ func (q *cachedQueueReader) prefetchLoop() {
 
 	for {
 		select {
-		case <-q.ctx.Done():
+		case <-s.ctx.Done():
 			return
 		case <-q.prefetchCh:
 			// Upper bound changed externally, recompute delay and reset timer.
-			timer.Reset(q.nextPrefetchDelay())
+			timer.Reset(s.nextPrefetchDelay())
 		case <-timer.Chan():
-			q.tryTimeEvictIfCacheFull()
-			if err := q.prefetch(); err != nil {
+			s.tryTimeEvictIfCacheFull()
+			if err := s.prefetch(); err != nil {
 				q.logger.Warn("prefetch failed, retrying shortly", tag.Error(err))
 				timer.Reset(q.options.MinPrefetchInterval())
 			} else {
-				timer.Reset(q.nextPrefetchDelay())
+				timer.Reset(s.nextPrefetchDelay())
 			}
 		}
 	}
@@ -276,7 +362,8 @@ func (q *cachedQueueReader) notifyPrefetch() {
 // nextPrefetchDelay returns how long to wait before the next prefetch. It
 // computes the trigger window relative to exclusiveUpperBound, clamped to
 // MinPrefetchInterval.
-func (q *cachedQueueReader) nextPrefetchDelay() time.Duration {
+func (s *scheduledStrategy) nextPrefetchDelay() time.Duration {
+	q := s.r
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 
@@ -406,7 +493,8 @@ func (q *cachedQueueReader) fallbackIfRangeIDChanged() bool {
 // prefetch fetches one page of tasks into the look-ahead window. Returns nil
 // on success (including no-op cases); non-nil on any failure. The caller
 // (prefetchLoop) schedules the next attempt.
-func (q *cachedQueueReader) prefetch() error {
+func (s *scheduledStrategy) prefetch() error {
+	q := s.r
 	if q.isDisabled() {
 		// Clear stale cache so re-enabling starts with a fresh prefetch
 		// instead of serving outdated boundaries that cause cache misses.
@@ -453,7 +541,7 @@ func (q *cachedQueueReader) prefetch() error {
 	q.prefetchTargetUpper = exclusiveMaxTaskKey
 	q.mu.Unlock()
 
-	resp, err := q.base.GetTask(q.ctx, &GetTaskRequest{
+	resp, err := q.base.GetTask(s.ctx, &GetTaskRequest{
 		Progress: &GetTaskProgress{
 			Range: Range{
 				InclusiveMinTaskKey: inclusiveMinTaskKey,
@@ -470,7 +558,7 @@ func (q *cachedQueueReader) prefetch() error {
 	defer q.mu.Unlock()
 	// Always clear the in-flight target and drain the buffer, even on error,
 	// so that buffered tasks are not permanently lost.
-	defer q.insertBufferedTasks()
+	defer s.insertBufferedTasks()
 	q.prefetchTargetUpper = persistence.MinimumHistoryTaskKey
 
 	if err != nil {
@@ -546,7 +634,8 @@ func (q *cachedQueueReader) isTaskCovered(key persistence.HistoryTaskKey) bool {
 // isToBufferTask reports whether the given task key should be placed in pendingInjectBuffer
 // and within [exclusiveUpperBound, prefetchTargetUpper) and if a prefetch is in-flight
 // Caller must hold q.mu (read or write).
-func (q *cachedQueueReader) isToBufferTask(key persistence.HistoryTaskKey) bool {
+func (s *scheduledStrategy) isToBufferTask(key persistence.HistoryTaskKey) bool {
+	q := s.r
 	// there is no in-flight prefetch, so no tasks should be buffered.
 	if q.prefetchTargetUpper.Equal(persistence.MinimumHistoryTaskKey) {
 		return false
@@ -564,9 +653,9 @@ func (q *cachedQueueReader) putTasks(tasks []persistence.Task) bool {
 		return false
 	}
 
-	// Lazy eviction: if inserting filtered tasks would exceed MaxSize, evict
-	// tasks older than TimeEvictionWindow first to make room.
-	q.tryTimeEvict(len(tasks))
+	// Lazy eviction: make room before inserting a new batch (scheduled: evict tasks older than
+	// TimeEvictionWindow if adding them would exceed MaxSize).
+	q.strategy.reclaimForInsert(len(tasks))
 	q.queue.PutTasks(tasks)
 	newUpper, trimmed := q.queue.RTrimBySize(q.options.MaxSize())
 
@@ -585,7 +674,8 @@ func (q *cachedQueueReader) putTasks(tasks []persistence.Task) bool {
 
 // insertBufferedTasks drains pendingInjectBuffer into the cache for tasks now
 // covered by the updated exclusiveUpperBound. Must be called under q.mu (write lock).
-func (q *cachedQueueReader) insertBufferedTasks() {
+func (s *scheduledStrategy) insertBufferedTasks() {
+	q := s.r
 	if len(q.pendingInjectBuffer) == 0 {
 		return
 	}
@@ -648,7 +738,8 @@ func (q *cachedQueueReader) advanceInclusiveLowerBound(newKey persistence.Histor
 // tryTimeEvict evicts tasks older than TimeEvictionWindow if adding extraTasks
 // would exceed MaxSize.
 // Caller must hold q.mu (write).
-func (q *cachedQueueReader) tryTimeEvict(extraTasks int) {
+func (s *scheduledStrategy) tryTimeEvict(extraTasks int) {
+	q := s.r
 	if q.queue.Len()+extraTasks < q.options.MaxSize() {
 		return
 	}
@@ -657,11 +748,12 @@ func (q *cachedQueueReader) tryTimeEvict(extraTasks int) {
 }
 
 // tryTimeEvictIfCacheFull evicts tasks older than TimeEvictionWindow if the cache is full
-func (q *cachedQueueReader) tryTimeEvictIfCacheFull() {
+func (s *scheduledStrategy) tryTimeEvictIfCacheFull() {
+	q := s.r
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	q.tryTimeEvict(1)
+	s.tryTimeEvict(1)
 }
 
 // UpdateReadLevel advances the lower bound to the processor's ack position.
@@ -722,17 +814,6 @@ func (q *cachedQueueReader) Inject(tasks []persistence.Task) {
 			covered = append(covered, t)
 			continue
 		}
-		if q.isToBufferTask(t.GetTaskKey()) {
-			buffered++
-			if q.logger.DebugOn() {
-				q.logger.Debug("buffering task",
-					tag.Dynamic("taskKey", t.GetTaskKey()),
-					tag.Dynamic("cacheState", q.getState()),
-				)
-			}
-			q.pendingInjectBuffer = append(q.pendingInjectBuffer, t)
-			continue
-		}
 
 		// this case should not happen under normal operation,
 		// as the processor should only be persisting tasks near the current upper bound
@@ -746,21 +827,19 @@ func (q *cachedQueueReader) Inject(tasks []persistence.Task) {
 			continue
 		}
 
-		// Task key is at or beyond the cache's exclusive upper bound (the prefetch
-		// frontier) and outside the in-flight prefetch buffer window, so the cache
-		// does not cover it and it is dropped. Record how far ahead of now it is
-		// scheduled: the frontier normally sits near now+lookahead, so this typically
-		// measures how far into the future the dropped task was scheduled, which helps
-		// tune the look-ahead window.
-		droppedUpper++
-		q.metrics.ExponentialHistogram(
-			metrics.CachedQueueDroppedFutureTimerTasksDurationHistogram,
-			t.GetTaskKey().GetScheduledTime().Sub(now),
-		)
-		if q.logger.DebugOn() {
-			q.logger.Debug("task key is beyond the upper/target prefetch bound, dropping task",
-				tag.Dynamic("taskKey", t.GetTaskKey()),
-				tag.Dynamic("cacheState", q.getState()),
+		// Task key is at or beyond the cache's exclusive upper bound (the prefetch frontier).
+		// The scheduled strategy buffers it (during an in-flight prefetch) or drops it.
+		switch q.strategy.onTaskBeyondFrontier(t) {
+		case injectStatusBuffered:
+			buffered++
+		case injectStatusDroppedUpper:
+			// Record how far ahead of now the dropped task is scheduled: the frontier normally
+			// sits near now+lookahead, so this typically measures how far into the future the
+			// dropped task was scheduled, which helps tune the look-ahead window.
+			droppedUpper++
+			q.metrics.ExponentialHistogram(
+				metrics.CachedQueueDroppedFutureTimerTasksDurationHistogram,
+				t.GetTaskKey().GetScheduledTime().Sub(now),
 			)
 		}
 	}

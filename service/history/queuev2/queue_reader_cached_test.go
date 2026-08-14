@@ -90,7 +90,7 @@ func setupMocksForCachedQueueReader(
 		metricsScope: metricsScope,
 	}
 
-	r := newCachedQueueReaderWithOptions(
+	r := newCachedQueueReaderWithStrategy(
 		deps.mockBase,
 		deps.mockQueue,
 		deps.mockShard,
@@ -98,6 +98,7 @@ func setupMocksForCachedQueueReader(
 		testlogger.New(t),
 		metrics.NewClient(metricsScope, metrics.History, metrics.MigrationConfig{}).Scope(metrics.TimerQueueProcessorV2Scope),
 		testOptions(overrides...),
+		newScheduledStrategy,
 	)
 
 	return r, deps
@@ -582,7 +583,7 @@ func TestCachedQueueReader_InsertBufferedTasks(t *testing.T) {
 			tc.setupMocks(queue)
 
 			r.mu.Lock()
-			r.insertBufferedTasks()
+			r.strategy.(*scheduledStrategy).insertBufferedTasks()
 			gotBuffer := r.pendingInjectBuffer
 			r.mu.Unlock()
 
@@ -1252,7 +1253,7 @@ func TestCachedQueueReader_GetTask_PeriodicShadowSample(t *testing.T) {
 				mockShard: mockShard,
 				clock:     clock.NewMockedTimeSource(),
 			}
-			r := newCachedQueueReaderWithOptions(
+			r := newCachedQueueReaderWithStrategy(
 				deps.mockBase,
 				deps.mockQueue,
 				deps.mockShard,
@@ -1263,6 +1264,7 @@ func TestCachedQueueReader_GetTask_PeriodicShadowSample(t *testing.T) {
 					o.Mode = dynamicproperties.GetStringPropertyFnFilteredByShardID("enabled")
 					o.ShadowSampleInterval = dynamicproperties.GetDurationPropertyFn(tc.interval)
 				}),
+				newScheduledStrategy,
 			)
 			setBounds(r, lower, upper)
 			deps.mockQueue.EXPECT().Len().Return(0).AnyTimes()
@@ -1986,7 +1988,7 @@ func TestCachedQueueReader_Prefetch(t *testing.T) {
 			}
 			tc.setupMocks(base, queue, r)
 
-			err := r.prefetch()
+			err := r.strategy.(*scheduledStrategy).prefetch()
 
 			r.mu.RLock()
 			gotLower := r.inclusiveLowerBound
@@ -2077,7 +2079,7 @@ func TestCachedQueueReader_NextPrefetchDelay(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			r.exclusiveUpperBound = tc.exclusiveUpperBound
-			d := r.nextPrefetchDelay()
+			d := r.strategy.(*scheduledStrategy).nextPrefetchDelay()
 			assert.GreaterOrEqual(t, d, tc.wantMinDelay)
 			assert.LessOrEqual(t, d, tc.wantMaxDelay)
 		})
@@ -2241,7 +2243,7 @@ func TestCachedQueueReader_IsToBufferTask(t *testing.T) {
 			setBounds(r, lower, upper)
 			r.prefetchTargetUpper = tc.prefetchTargetUpper
 
-			assert.Equal(t, tc.want, r.isToBufferTask(tc.key))
+			assert.Equal(t, tc.want, r.strategy.(*scheduledStrategy).isToBufferTask(tc.key))
 		})
 	}
 }
