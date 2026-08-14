@@ -62,6 +62,19 @@ type CachedQueueReader interface {
 	Stop()
 }
 
+// readerConfig is the dynamic configuration the mode-agnostic caching engine consults directly.
+// These are plain values, not behavior, so they live on the reader rather than behind the
+// windowStrategy interface. The mode-specific keys they resolve (per-shard timer vs global transfer)
+// are supplied by whoever constructs the reader; the reader itself stays mode-agnostic.
+type readerConfig struct {
+	// mode resolves the current cache mode ("enabled"/"shadow"/"disabled"/…).
+	mode func() string
+	// maxSize is the cache size cap enforced by putTasks (RTrimBySize) and scheduled eviction.
+	maxSize func() int
+	// shadowSampleInterval is the periodic shadow-sample cadence for "enabled" mode; <= 0 disables it.
+	shadowSampleInterval func() time.Duration
+}
+
 type cachedQueueReader struct {
 	status  int32 // DaemonStatusInitialized / Started / Stopped
 	base    QueueReader
@@ -71,8 +84,12 @@ type cachedQueueReader struct {
 	logger  log.Logger
 	metrics metrics.Scope
 
-	// strategy owns the mode-specific config and behavior (Start/Stop, Inject's beyond-frontier
-	// branch, putTasks reclaim). Set once at construction.
+	// cfg is the engine-level dynamic configuration (mode, size cap, shadow cadence). Set once at
+	// construction from the mode-specific config keys.
+	cfg readerConfig
+
+	// strategy owns the mode-specific behavior (Start/Stop, Inject's beyond-frontier branch,
+	// putTasks reclaim) and the prefetch/evict tuning it needs. Set once at construction.
 	strategy windowStrategy
 
 	mu sync.RWMutex
@@ -137,26 +154,29 @@ func newCachedQueueReader(
 		shard.GetTimeSource(),
 		shard.GetLogger().WithTags(tag.ComponentCachedQueueReader),
 		metricsScope,
+		readerConfig{
+			mode:                 func() string { return config.TimerProcessorCachedQueueReaderMode(shard.GetShardID()) },
+			maxSize:              func() int { return config.TimerProcessorCacheMaxSize() },
+			shadowSampleInterval: func() time.Duration { return config.TimerProcessorCachedQueueReaderShadowSampleInterval() },
+		},
 		func(r *cachedQueueReader) windowStrategy {
 			return newScheduledStrategy(r, scheduledOptions{
-				Mode:                      config.TimerProcessorCachedQueueReaderMode,
-				MaxSize:                   config.TimerProcessorCacheMaxSize,
 				MaxLookAheadWindow:        config.TimerProcessorMaxPollInterval,
 				PrefetchTriggerWindow:     config.TimerProcessorCachePrefetchTriggerWindow,
 				PrefetchPageSize:          config.TimerTaskBatchSize,
 				TimeEvictionWindow:        config.TimerProcessorCacheTimeEvictionWindow,
 				MinPrefetchInterval:       config.TimerProcessorCacheMinPrefetchInterval,
 				PrefetchJitterCoefficient: config.TimerProcessorMaxPollIntervalJitterCoefficient,
-				ShadowSampleInterval:      config.TimerProcessorCachedQueueReaderShadowSampleInterval,
 			})
 		},
 	)
 }
 
-// newCachedQueueReaderWithStrategy builds the generic reader and attaches the window strategy the
-// factory produces. The strategy owns all mode-specific configuration (dynamic-config keys) and
-// behavior; the reader is a mode-agnostic caching engine. Used directly by tests to inject a
-// strategy; production entry points (newCachedQueueReader) wrap it with a concrete strategy.
+// newCachedQueueReaderWithStrategy builds the generic reader from its engine config and attaches the
+// window strategy the factory produces. cfg carries the mode-agnostic engine configuration the reader
+// consults directly; the strategy owns the mode-specific behavior and its prefetch/evict tuning. Used
+// directly by tests; production entry points (newCachedQueueReader) resolve cfg + strategy from the
+// mode-specific config keys.
 func newCachedQueueReaderWithStrategy(
 	base QueueReader,
 	queue InMemQueue,
@@ -164,6 +184,7 @@ func newCachedQueueReaderWithStrategy(
 	clockSource clock.TimeSource,
 	logger log.Logger,
 	metricsScope metrics.Scope,
+	cfg readerConfig,
 	newStrategy func(*cachedQueueReader) windowStrategy,
 ) *cachedQueueReader {
 	q := &cachedQueueReader{
@@ -174,6 +195,7 @@ func newCachedQueueReaderWithStrategy(
 		clock:               clockSource,
 		logger:              logger,
 		metrics:             metricsScope,
+		cfg:                 cfg,
 		inclusiveLowerBound: persistence.MinimumHistoryTaskKey,
 		exclusiveUpperBound: persistence.MinimumHistoryTaskKey,
 		prefetchCh:          make(chan struct{}, 1),
@@ -183,12 +205,13 @@ func newCachedQueueReaderWithStrategy(
 	return q
 }
 
-// windowStrategy owns everything that differs between the scheduled (timer) and immediate (transfer)
-// cached readers: the mode-specific dynamic-config keys and the behavior at the seams — Start/Stop
-// (background work), Inject's beyond-frontier branch, and putTasks (capacity reclaim). The reader is
-// a mode-agnostic caching engine (coverage checks, GetTask serving, read-level + size-cap eviction,
-// rangeID fencing, the shadow subsystem) parameterized by one strategy, set once at construction.
-// Each implementation holds a back-reference to the reader it belongs to.
+// windowStrategy owns the behavior that differs between the scheduled (timer) and immediate
+// (transfer) cached readers: the seams Start/Stop (background work), Inject's beyond-frontier branch,
+// and putTasks (capacity reclaim). The reader is a mode-agnostic caching engine (coverage checks,
+// GetTask serving, read-level + size-cap eviction, rangeID fencing, the shadow subsystem) parameterized
+// by one strategy plus its readerConfig, both set once at construction. Engine-level configuration
+// (mode/maxSize/shadowSampleInterval) lives on the reader as readerConfig, not here — those are values,
+// not behavior. Each implementation holds a back-reference to the reader it belongs to.
 type windowStrategy interface {
 	// start launches background work. scheduled: the prefetch loop. immediate: no-op.
 	start()
@@ -204,28 +227,14 @@ type windowStrategy interface {
 	// reclaimForInsert makes room before inserting extra tasks.
 	// scheduled: time-based eviction. immediate: no-op.
 	reclaimForInsert(extra int)
-
-	// mode returns the current cache mode ("enabled"/"shadow"/"disabled"/…). scheduled reads the
-	// per-shard timer key; immediate will read the global transfer key.
-	mode() string
-	// maxSize is the cache size cap the reader's putTasks enforces via RTrimBySize.
-	maxSize() int
-	// shadowSampleInterval is the periodic shadow-sample cadence for "enabled" mode; <= 0 disables it.
-	shadowSampleInterval() time.Duration
 }
 
 var _ windowStrategy = (*scheduledStrategy)(nil)
 
-// scheduledOptions is the scheduled (timer) strategy's dynamic configuration, populated from
-// shard.Context. It carries both the config the reader's generic core consults through the strategy
-// (Mode/MaxSize/ShadowSampleInterval) and the prefetch-only tuning knobs used solely by this strategy.
+// scheduledOptions is the scheduled (timer) strategy's prefetch/eviction tuning, populated from
+// shard.Context and used solely by this strategy. Engine-level config the reader consults
+// (mode/maxSize/shadowSampleInterval) lives on the reader as readerConfig, not here.
 type scheduledOptions struct {
-	// Mode controls cache behavior: "enabled" uses cache, anything else (including "disabled") disables.
-	// Shard-filtered because the timer cache mode is a per-shard dynamic-config key.
-	Mode dynamicproperties.StringPropertyFnWithShardIDFilter
-	// MaxSize is the maximum number of tasks the cache may hold at once.
-	// Insertions that would exceed this limit trigger time-based eviction first.
-	MaxSize dynamicproperties.IntPropertyFn
 	// MaxLookAheadWindow is how far into the future from now the cache prefetches.
 	// Tasks with scheduled time beyond now+MaxLookAheadWindow are not fetched.
 	MaxLookAheadWindow dynamicproperties.DurationPropertyFn
@@ -245,10 +254,6 @@ type scheduledOptions struct {
 	// PrefetchJitterCoefficient is passed to backoff.JitDuration when computing
 	// the next prefetch delay. Must be in [0, 1]. Zero disables jitter.
 	PrefetchJitterCoefficient dynamicproperties.FloatPropertyFn
-	// ShadowSampleInterval controls how often, at most, a GetTask call in "enabled" mode
-	// is diverted through the shadow comparison path for continuous regression detection.
-	// <= 0 disables sampling.
-	ShadowSampleInterval dynamicproperties.DurationPropertyFn
 }
 
 // scheduledStrategy implements the timer (scheduled) window behavior: a background prefetch loop
@@ -267,17 +272,6 @@ type scheduledStrategy struct {
 func newScheduledStrategy(r *cachedQueueReader, opts scheduledOptions) windowStrategy {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &scheduledStrategy{r: r, opts: opts, ctx: ctx, cancel: cancel}
-}
-
-// mode returns the timer cache mode for the reader's shard.
-func (s *scheduledStrategy) mode() string { return s.opts.Mode(s.r.shard.GetShardID()) }
-
-// maxSize returns the cache size cap.
-func (s *scheduledStrategy) maxSize() int { return s.opts.MaxSize() }
-
-// shadowSampleInterval returns the periodic shadow-sample cadence.
-func (s *scheduledStrategy) shadowSampleInterval() time.Duration {
-	return s.opts.ShadowSampleInterval()
 }
 
 // start launches the background prefetch loop.
@@ -401,12 +395,12 @@ func (s *scheduledStrategy) nextPrefetchDelay() time.Duration {
 
 // isEnabled returns true if the cache is fully enabled
 func (q *cachedQueueReader) isEnabled() bool {
-	return q.strategy.mode() == "enabled"
+	return q.cfg.mode() == "enabled"
 }
 
 // isShadow returns true when cache runs in shadow mode — results are compared
 // against the DB but the DB result is returned to the processor.
-func (q *cachedQueueReader) isShadow() bool { return q.strategy.mode() == "shadow" }
+func (q *cachedQueueReader) isShadow() bool { return q.cfg.mode() == "shadow" }
 
 // isCachedQueueReaderDisabled reports whether the given mode disables the cached queue reader.
 func isCachedQueueReaderDisabled(mode string) bool {
@@ -420,7 +414,7 @@ func isCachedQueueReaderDisabled(mode string) bool {
 
 // isDisabled returns true for the "disabled" mode and for any unrecognised value
 func (q *cachedQueueReader) isDisabled() bool {
-	return isCachedQueueReaderDisabled(q.strategy.mode())
+	return isCachedQueueReaderDisabled(q.cfg.mode())
 }
 
 // IsEmpty reports whether the cache queue reader is empty
@@ -524,7 +518,7 @@ func (s *scheduledStrategy) prefetch() error {
 	}
 
 	q.mu.RLock()
-	availableCacheSize := s.opts.MaxSize() - q.queue.Len()
+	availableCacheSize := q.cfg.maxSize() - q.queue.Len()
 	upperBound := q.exclusiveUpperBound
 	q.mu.RUnlock()
 
@@ -678,7 +672,7 @@ func (q *cachedQueueReader) putTasks(tasks []persistence.Task) bool {
 	// immediate: no-op (size-cap eviction below still applies).
 	q.strategy.reclaimForInsert(len(tasks))
 	q.queue.PutTasks(tasks)
-	newUpper, trimmed := q.queue.RTrimBySize(q.strategy.maxSize())
+	newUpper, trimmed := q.queue.RTrimBySize(q.cfg.maxSize())
 
 	if !trimmed {
 		return false
@@ -761,7 +755,7 @@ func (q *cachedQueueReader) advanceInclusiveLowerBound(newKey persistence.Histor
 // Caller must hold q.mu (write).
 func (s *scheduledStrategy) tryTimeEvict(extraTasks int) {
 	q := s.r
-	if q.queue.Len()+extraTasks < s.opts.MaxSize() {
+	if q.queue.Len()+extraTasks < q.cfg.maxSize() {
 		return
 	}
 	evictBefore := persistence.NewHistoryTaskKey(q.clock.Now().Add(-s.opts.TimeEvictionWindow()), 0)
@@ -975,7 +969,7 @@ func (q *cachedQueueReader) GetTask(ctx context.Context, req *GetTaskRequest) (*
 // "shadow" mode. Remove once CachedQueueReader is enabled by default and "shadow"
 // mode rollouts (and this periodic variant of it) are no longer needed.
 func (q *cachedQueueReader) isPeriodicShadowSample() bool {
-	interval := q.strategy.shadowSampleInterval()
+	interval := q.cfg.shadowSampleInterval()
 	if interval <= 0 {
 		return false
 	}
