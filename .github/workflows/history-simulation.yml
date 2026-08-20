@@ -16,6 +16,7 @@ jobs:
           - default
           - queuev2
           - queuev2_scheduled_cache_enabled
+          - queuev2_transfer_cache_enabled
           - queuev2_split
     continue-on-error: ${{ matrix.experimental == true }}
 

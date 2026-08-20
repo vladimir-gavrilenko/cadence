@@ -139,20 +139,28 @@ func (f *transferQueueFactory) createQueuev2(
 		logger,
 	)
 	config := shard.GetConfig()
+	metricsScope := shard.GetMetricsClient().Scope(metrics.TransferQueueProcessorV2Scope).Tagged(metrics.ShardIDTag(shard.GetShardID()))
+
+	var cachedReader CachedQueueReader
 	queueReader := NewQueueReader(
 		shard,
 		persistence.HistoryTaskCategoryTransfer,
 		config.TransferProcessorMaxPollInterval,
 		config.TransferProcessorMaxPollIntervalJitterCoefficient,
 	)
-	return NewImmediateQueue(
+	if !isCachedQueueReaderDisabled(config.TransferProcessorCachedQueueReaderMode(shard.GetShardID())) {
+		cachedReader = newCachedImmediateQueueReader(queueReader, newInMemQueue(), shard, metricsScope)
+		queueReader = cachedReader
+	}
+
+	inner := newImmediateQueue(
 		shard,
 		persistence.HistoryTaskCategoryTransfer,
 		f.taskProcessor,
 		executorWrapper,
 		logger,
 		shard.GetMetricsClient(),
-		shard.GetMetricsClient().Scope(metrics.TransferQueueProcessorV2Scope).Tagged(metrics.ShardIDTag(shard.GetShardID())),
+		metricsScope,
 		queueReader,
 		&Options{
 			PageSize:                             config.TransferTaskBatchSize,
@@ -175,4 +183,10 @@ func (f *transferQueueFactory) createQueuev2(
 			MaxVirtualQueueCount:                 config.QueueMaxVirtualQueueCount,
 		},
 	)
+
+	if cachedReader != nil {
+		return newCachedImmediateQueue(inner, cachedReader)
+	}
+
+	return inner
 }

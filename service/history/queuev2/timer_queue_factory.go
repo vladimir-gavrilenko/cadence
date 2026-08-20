@@ -152,7 +152,7 @@ func (f *timerQueueFactory) createQueuev2(
 		MaxVirtualQueueCount:                 config.QueueMaxVirtualQueueCount,
 	}
 
-	var cachedReader CachedQueueReader
+	var cachedReader CachedQueueReaderDaemon
 	reader := NewQueueReader(
 		shard,
 		persistence.HistoryTaskCategoryTimer,
@@ -160,7 +160,7 @@ func (f *timerQueueFactory) createQueuev2(
 		options.MaxPollIntervalJitterCoefficient,
 	)
 	if !isCachedQueueReaderDisabled(config.TimerProcessorCachedQueueReaderMode(shard.GetShardID())) {
-		cachedReader = newCachedQueueReader(reader, newInMemQueue(), shard, metricsScope)
+		cachedReader = newCachedScheduledQueueReader(reader, newInMemQueue(), shard, metricsScope)
 		reader = cachedReader
 	}
 

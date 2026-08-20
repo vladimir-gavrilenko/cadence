@@ -110,7 +110,9 @@ func (s *contextImpl) notifyTasksFromConflictResolveWorkflowExecution(
 // is in shadow mode. In shadow mode the cache is validated against the DB, so dropped tasks
 // produce observable mismatches that are worth tracking. In other modes the log is noise.
 func (s *contextImpl) logNotifyTaskDroppedOnPersistenceError(err error, droppedTaskIDs []int64) {
-	if s.config.TimerProcessorCachedQueueReaderMode(s.GetShardID()) != "shadow" {
+	shardID := s.GetShardID()
+	if s.config.TimerProcessorCachedQueueReaderMode(shardID) != "shadow" &&
+		s.config.TransferProcessorCachedQueueReaderMode(shardID) != "shadow" {
 		return
 	}
 	s.logger.Info("notify tasks dropped due to persistence error",

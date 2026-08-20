@@ -1128,6 +1128,13 @@ const (
 	// Allowed filters: N/A
 	TimerProcessorCacheMaxSize
 
+	// TransferProcessorCacheMaxSize is the hard cap on cached task count
+	// KeyName: history.transferProcessorCacheMaxSize
+	// Value type: Int
+	// Default value: 1000
+	// Allowed filters: N/A
+	TransferProcessorCacheMaxSize
+
 	// TransferTaskBatchSize is batch size for transferQueueProcessor
 	// KeyName: history.transferTaskBatchSize
 	// Value type: Int
@@ -2749,6 +2756,16 @@ const (
 	// Allowed filters: ShardID
 	TimerProcessorCachedQueueReaderMode
 
+	// TransferProcessorCachedQueueReaderMode controls whether and how the cached queue reader is used.
+	// "disabled" (default): no cached reader, plain immediateQueue is used.
+	// "shadow": cached reader is populated via injection, but all reads are forwarded to the base reader.
+	// "enabled": cached reader fully active.
+	// KeyName: history.transferProcessorCachedQueueReaderMode
+	// Value type: string enum: "disabled", "shadow", "enabled"
+	// Default value: "disabled"
+	// Allowed filters: ShardID
+	TransferProcessorCachedQueueReaderMode
+
 	// LastStringKey must be the last one in this const group
 	LastStringKey
 )
@@ -3071,6 +3088,16 @@ const (
 	// Default value: 5m (5*time.Minute)
 	// Allowed filters: ShardID
 	TimerProcessorCachedQueueReaderShadowSampleInterval
+	// TransferProcessorCachedQueueReaderShadowSampleInterval controls how often, at most once per this
+	// interval, a GetTask call is diverted through the shadow comparison path while
+	// TransferProcessorCachedQueueReaderMode is "enabled". This provides continuous regression
+	// detection for the cache in enabled mode, independent of request volume. A value <= 0
+	// disables sampling.
+	// KeyName: history.transferProcessorCachedQueueReaderShadowSampleInterval
+	// Value type: Duration
+	// Default value: 5m (5*time.Minute)
+	// Allowed filters: N/A
+	TransferProcessorCachedQueueReaderShadowSampleInterval
 	// TransferProcessorFailoverMaxStartJitterInterval is the max jitter interval for starting transfer
 	// failover queue processing. The actual jitter interval used will be a random duration between
 	// 0 and the max interval so that timer failover queue across different shards won't start at
@@ -4152,6 +4179,11 @@ var IntKeys = map[IntKey]DynamicInt{
 	TimerProcessorCacheMaxSize: {
 		KeyName:      "history.timerProcessorCacheMaxSize",
 		Description:  "TimerProcessorCacheMaxSize is the hard cap on cached task count",
+		DefaultValue: 1000,
+	},
+	TransferProcessorCacheMaxSize: {
+		KeyName:      "history.transferProcessorCacheMaxSize",
+		Description:  "TransferProcessorCacheMaxSize is the hard cap on cached task count",
 		DefaultValue: 1000,
 	},
 	TransferTaskBatchSize: {
@@ -5534,6 +5566,12 @@ var StringKeys = map[StringKey]DynamicString{
 		DefaultValue: "disabled",
 		Filters:      []Filter{ShardID},
 	},
+	TransferProcessorCachedQueueReaderMode: {
+		KeyName:      "history.transferProcessorCachedQueueReaderMode",
+		Description:  "TransferProcessorCachedQueueReaderMode controls whether and how the cached queue reader is used: disabled/shadow/enabled",
+		DefaultValue: "disabled",
+		Filters:      []Filter{ShardID},
+	},
 }
 
 var DurationKeys = map[DurationKey]DynamicDuration{
@@ -5822,6 +5860,11 @@ var DurationKeys = map[DurationKey]DynamicDuration{
 	TimerProcessorCachedQueueReaderShadowSampleInterval: {
 		KeyName:      "history.timerProcessorCachedQueueReaderShadowSampleInterval",
 		Description:  "TimerProcessorCachedQueueReaderShadowSampleInterval controls how often, at most, a GetTask call is diverted through the shadow comparison path while in enabled mode. <= 0 disables sampling.",
+		DefaultValue: time.Minute * 5,
+	},
+	TransferProcessorCachedQueueReaderShadowSampleInterval: {
+		KeyName:      "history.transferProcessorCachedQueueReaderShadowSampleInterval",
+		Description:  "TransferProcessorCachedQueueReaderShadowSampleInterval controls how often, at most, a GetTask call is diverted through the shadow comparison path while in enabled mode. <= 0 disables sampling.",
 		DefaultValue: time.Minute * 5,
 	},
 	TransferProcessorFailoverMaxStartJitterInterval: {

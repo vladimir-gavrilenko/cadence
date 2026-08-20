@@ -29,12 +29,12 @@ import (
 	hcommon "github.com/uber/cadence/service/history/common"
 )
 
-type cachedScheduledQueue struct {
-	*scheduledQueue
-	reader CachedQueueReaderDaemon
+type cachedImmediateQueue struct {
+	*immediateQueue
+	reader CachedQueueReader
 }
 
-func newCachedScheduledQueue(inner *scheduledQueue, reader CachedQueueReaderDaemon) Queue {
+func newCachedImmediateQueue(inner *immediateQueue, reader CachedQueueReader) Queue {
 	// Wrap the queue state update to propagate min read level across all virtual queues
 	// to CachedQueueReader each time the ack level is updated
 	originalUpdateFn := inner.base.updateQueueStateFn
@@ -48,27 +48,20 @@ func newCachedScheduledQueue(inner *scheduledQueue, reader CachedQueueReaderDaem
 		reader.UpdateReadLevel(readLevel)
 	}
 
-	return &cachedScheduledQueue{
-		scheduledQueue: inner,
+	return &cachedImmediateQueue{
+		immediateQueue: inner,
 		reader:         reader,
 	}
 }
 
-func (q *cachedScheduledQueue) NotifyNewTask(clusterName string, info *hcommon.NotifyTaskInfo) {
+func (q *cachedImmediateQueue) NotifyNewTask(clusterName string, info *hcommon.NotifyTaskInfo) {
 	if info.PersistenceError {
 		q.reader.Clear()
 	} else {
 		q.reader.Inject(info.Tasks)
 	}
-	q.scheduledQueue.NotifyNewTask(clusterName, info)
+	q.immediateQueue.NotifyNewTask(clusterName, info)
 }
 
-func (q *cachedScheduledQueue) Start() {
-	q.reader.Start()
-	q.scheduledQueue.Start()
-}
-
-func (q *cachedScheduledQueue) Stop() {
-	q.scheduledQueue.Stop()
-	q.reader.Stop()
-}
+// Start and Stop are inherited from the embedded *immediateQueue: the reader has no background
+// lifecycle of its own to drive (see CachedQueueReader vs CachedQueueReaderDaemon).

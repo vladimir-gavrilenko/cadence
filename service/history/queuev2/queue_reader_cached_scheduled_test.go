@@ -42,17 +42,30 @@ import (
 	"github.com/uber/cadence/service/history/shard"
 )
 
-func testOptions(overrides ...func(*cachedQueueReaderOptions)) *cachedQueueReaderOptions {
-	opts := &cachedQueueReaderOptions{
-		Mode:                      dynamicproperties.GetStringPropertyFnFilteredByShardID("enabled"),
-		MaxSize:                   dynamicproperties.GetIntPropertyFn(100),
-		MaxLookAheadWindow:        dynamicproperties.GetDurationPropertyFn(time.Hour),
-		PrefetchTriggerWindow:     dynamicproperties.GetDurationPropertyFn(5 * time.Minute),
-		PrefetchPageSize:          dynamicproperties.GetIntPropertyFn(10),
-		TimeEvictionWindow:        dynamicproperties.GetDurationPropertyFn(time.Minute),
-		MinPrefetchInterval:       dynamicproperties.GetDurationPropertyFn(100 * time.Millisecond),
-		PrefetchJitterCoefficient: dynamicproperties.GetFloatPropertyFn(0),
-		ShadowSampleInterval:      dynamicproperties.GetDurationPropertyFn(0),
+// testCachedQueueReaderOptions embeds both the common options and the scheduled/timer-only
+// prefetch options so existing test overrides can keep referencing fields from either
+// (e.g. o.MaxSize or o.PrefetchTriggerWindow) via field promotion, without needing to know
+// which struct each field now lives in.
+type testCachedQueueReaderOptions struct {
+	*cachedQueueReaderOptions
+	*scheduledCachePrefetchOptions
+}
+
+func testOptions(overrides ...func(*testCachedQueueReaderOptions)) *testCachedQueueReaderOptions {
+	opts := &testCachedQueueReaderOptions{
+		cachedQueueReaderOptions: &cachedQueueReaderOptions{
+			Mode:                 dynamicproperties.GetStringPropertyFnFilteredByShardID("enabled"),
+			MaxSize:              dynamicproperties.GetIntPropertyFn(100),
+			ShadowSampleInterval: dynamicproperties.GetDurationPropertyFn(0),
+		},
+		scheduledCachePrefetchOptions: &scheduledCachePrefetchOptions{
+			MaxLookAheadWindow:        dynamicproperties.GetDurationPropertyFn(time.Hour),
+			PrefetchTriggerWindow:     dynamicproperties.GetDurationPropertyFn(5 * time.Minute),
+			PrefetchPageSize:          dynamicproperties.GetIntPropertyFn(10),
+			TimeEvictionWindow:        dynamicproperties.GetDurationPropertyFn(time.Minute),
+			MinPrefetchInterval:       dynamicproperties.GetDurationPropertyFn(100 * time.Millisecond),
+			PrefetchJitterCoefficient: dynamicproperties.GetFloatPropertyFn(0),
+		},
 	}
 	for _, o := range overrides {
 		if o == nil {
@@ -74,8 +87,8 @@ type cachedQueueReaderMockDeps struct {
 func setupMocksForCachedQueueReader(
 	t *testing.T,
 	ctrl *gomock.Controller,
-	overrides ...func(*cachedQueueReaderOptions),
-) (*cachedQueueReader, *cachedQueueReaderMockDeps) {
+	overrides ...func(*testCachedQueueReaderOptions),
+) (*cachedScheduledQueueReader, *cachedQueueReaderMockDeps) {
 	t.Helper()
 	mockShard := shard.NewMockContext(ctrl)
 	mockShard.EXPECT().GetRangeID().Return(int64(0)).AnyTimes()
@@ -90,20 +103,22 @@ func setupMocksForCachedQueueReader(
 		metricsScope: metricsScope,
 	}
 
-	r := newCachedQueueReaderWithOptions(
+	opts := testOptions(overrides...)
+	r := newCachedScheduledQueueReaderWithOptions(
 		deps.mockBase,
 		deps.mockQueue,
 		deps.mockShard,
 		deps.clock,
 		testlogger.New(t),
 		metrics.NewClient(metricsScope, metrics.History, metrics.MigrationConfig{}).Scope(metrics.TimerQueueProcessorV2Scope),
-		testOptions(overrides...),
+		opts.cachedQueueReaderOptions,
+		opts.scheduledCachePrefetchOptions,
 	)
 
 	return r, deps
 }
 
-func setBounds(r *cachedQueueReader, lower, upper persistence.HistoryTaskKey) {
+func setBounds(r *cachedScheduledQueueReader, lower, upper persistence.HistoryTaskKey) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.inclusiveLowerBound = lower
@@ -155,7 +170,7 @@ func TestCachedQueueReader_Modes(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.mode, func(t *testing.T) {
 			ctrl := gomock.NewController(t)
-			r, _ := setupMocksForCachedQueueReader(t, ctrl, func(o *cachedQueueReaderOptions) {
+			r, _ := setupMocksForCachedQueueReader(t, ctrl, func(o *testCachedQueueReaderOptions) {
 				o.Mode = dynamicproperties.GetStringPropertyFnFilteredByShardID(tc.mode)
 			})
 			assert.Equal(t, tc.enabled, r.isEnabled(), "mode %q: isEnabled", tc.mode)
@@ -286,7 +301,7 @@ func TestCachedQueueReader_Inject(t *testing.T) {
 		name                string
 		tasks               []persistence.Task
 		initPrefetchTarget  persistence.HistoryTaskKey
-		optsOverride        func(*cachedQueueReaderOptions)
+		optsOverride        func(*testCachedQueueReaderOptions)
 		setupMocks          func(queue *MockInMemQueue)
 		wantUpper           persistence.HistoryTaskKey
 		wantBufferLen       int
@@ -299,7 +314,7 @@ func TestCachedQueueReader_Inject(t *testing.T) {
 		{
 			name:  "disabled clears stale cache",
 			tasks: []persistence.Task{inside},
-			optsOverride: func(o *cachedQueueReaderOptions) {
+			optsOverride: func(o *testCachedQueueReaderOptions) {
 				o.Mode = dynamicproperties.GetStringPropertyFnFilteredByShardID("disabled")
 			},
 			setupMocks: func(queue *MockInMemQueue) {
@@ -363,7 +378,7 @@ func TestCachedQueueReader_Inject(t *testing.T) {
 			// RTrimBySize fires and the upper bound must shrink to the trim key.
 			name:  "trims when over capacity: upper bound updated",
 			tasks: []persistence.Task{inside},
-			optsOverride: func(o *cachedQueueReaderOptions) {
+			optsOverride: func(o *testCachedQueueReaderOptions) {
 				o.MaxSize = dynamicproperties.GetIntPropertyFn(1)
 			},
 			setupMocks: func(queue *MockInMemQueue) {
@@ -884,7 +899,7 @@ func TestCachedQueueReader_GetTask(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			ctrl := gomock.NewController(t)
-			r, deps := setupMocksForCachedQueueReader(t, ctrl, func(o *cachedQueueReaderOptions) {
+			r, deps := setupMocksForCachedQueueReader(t, ctrl, func(o *testCachedQueueReaderOptions) {
 				o.Mode = dynamicproperties.GetStringPropertyFnFilteredByShardID(tc.mode)
 			})
 			base, queue := deps.mockBase, deps.mockQueue
@@ -1125,7 +1140,7 @@ func TestCachedQueueReader_GetTask_Shadow(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			ctrl := gomock.NewController(t)
-			r, deps := setupMocksForCachedQueueReader(t, ctrl, func(o *cachedQueueReaderOptions) {
+			r, deps := setupMocksForCachedQueueReader(t, ctrl, func(o *testCachedQueueReaderOptions) {
 				o.Mode = dynamicproperties.GetStringPropertyFnFilteredByShardID("shadow")
 			})
 			setBounds(r, tc.lower, tc.upper)
@@ -1252,17 +1267,19 @@ func TestCachedQueueReader_GetTask_PeriodicShadowSample(t *testing.T) {
 				mockShard: mockShard,
 				clock:     clock.NewMockedTimeSource(),
 			}
-			r := newCachedQueueReaderWithOptions(
+			opts := testOptions(func(o *testCachedQueueReaderOptions) {
+				o.Mode = dynamicproperties.GetStringPropertyFnFilteredByShardID("enabled")
+				o.ShadowSampleInterval = dynamicproperties.GetDurationPropertyFn(tc.interval)
+			})
+			r := newCachedScheduledQueueReaderWithOptions(
 				deps.mockBase,
 				deps.mockQueue,
 				deps.mockShard,
 				deps.clock,
 				logger,
 				metrics.NoopScope,
-				testOptions(func(o *cachedQueueReaderOptions) {
-					o.Mode = dynamicproperties.GetStringPropertyFnFilteredByShardID("enabled")
-					o.ShadowSampleInterval = dynamicproperties.GetDurationPropertyFn(tc.interval)
-				}),
+				opts.cachedQueueReaderOptions,
+				opts.scheduledCachePrefetchOptions,
 			)
 			setBounds(r, lower, upper)
 			deps.mockQueue.EXPECT().Len().Return(0).AnyTimes()
@@ -1684,7 +1701,7 @@ func TestCachedQueueReader_LookAHead(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			ctrl := gomock.NewController(t)
-			r, deps := setupMocksForCachedQueueReader(t, ctrl, func(o *cachedQueueReaderOptions) {
+			r, deps := setupMocksForCachedQueueReader(t, ctrl, func(o *testCachedQueueReaderOptions) {
 				o.Mode = dynamicproperties.GetStringPropertyFnFilteredByShardID(tc.mode)
 			})
 			base, queue := deps.mockBase, deps.mockQueue
@@ -1731,11 +1748,11 @@ func TestCachedQueueReader_Prefetch(t *testing.T) {
 	t4 := newTask(4, now.Add(40*time.Minute))
 	tests := []struct {
 		name                  string
-		optsOverride          func(*cachedQueueReaderOptions)
+		optsOverride          func(*testCachedQueueReaderOptions)
 		initLower             persistence.HistoryTaskKey
 		initUpper             persistence.HistoryTaskKey
 		initBuffer            []persistence.Task
-		setupMocks            func(base *MockQueueReader, queue *MockInMemQueue, r *cachedQueueReader)
+		setupMocks            func(base *MockQueueReader, queue *MockInMemQueue, r *cachedScheduledQueueReader)
 		wantErr               bool
 		wantLower             persistence.HistoryTaskKey
 		wantUpper             persistence.HistoryTaskKey
@@ -1745,23 +1762,23 @@ func TestCachedQueueReader_Prefetch(t *testing.T) {
 	}{
 		{
 			name: "disabled: no-op when cache empty",
-			optsOverride: func(o *cachedQueueReaderOptions) {
+			optsOverride: func(o *testCachedQueueReaderOptions) {
 				o.Mode = dynamicproperties.GetStringPropertyFnFilteredByShardID("disabled")
 			},
 			initLower:  persistence.MinimumHistoryTaskKey,
 			initUpper:  persistence.MinimumHistoryTaskKey,
-			setupMocks: func(base *MockQueueReader, queue *MockInMemQueue, _ *cachedQueueReader) {},
+			setupMocks: func(base *MockQueueReader, queue *MockInMemQueue, _ *cachedScheduledQueueReader) {},
 			wantLower:  persistence.MinimumHistoryTaskKey,
 			wantUpper:  persistence.MinimumHistoryTaskKey,
 		},
 		{
 			name: "disabled: clears stale cache when not empty",
-			optsOverride: func(o *cachedQueueReaderOptions) {
+			optsOverride: func(o *testCachedQueueReaderOptions) {
 				o.Mode = dynamicproperties.GetStringPropertyFnFilteredByShardID("disabled")
 			},
 			initLower: someLower,
 			initUpper: someUpper,
-			setupMocks: func(base *MockQueueReader, queue *MockInMemQueue, _ *cachedQueueReader) {
+			setupMocks: func(base *MockQueueReader, queue *MockInMemQueue, _ *cachedScheduledQueueReader) {
 				queue.EXPECT().Clear()
 				queue.EXPECT().Len().Return(0).AnyTimes()
 			},
@@ -1772,7 +1789,7 @@ func TestCachedQueueReader_Prefetch(t *testing.T) {
 			name:      "cache full: skips DB fetch, bounds unchanged",
 			initLower: someLower,
 			initUpper: someUpper,
-			setupMocks: func(base *MockQueueReader, queue *MockInMemQueue, _ *cachedQueueReader) {
+			setupMocks: func(base *MockQueueReader, queue *MockInMemQueue, _ *cachedScheduledQueueReader) {
 				queue.EXPECT().Len().Return(maxSize).AnyTimes()
 			},
 			wantLower: someLower,
@@ -1782,7 +1799,7 @@ func TestCachedQueueReader_Prefetch(t *testing.T) {
 			name:      "DB error: returns error, bounds unchanged",
 			initLower: someLower,
 			initUpper: someUpper,
-			setupMocks: func(base *MockQueueReader, queue *MockInMemQueue, _ *cachedQueueReader) {
+			setupMocks: func(base *MockQueueReader, queue *MockInMemQueue, _ *cachedScheduledQueueReader) {
 				queue.EXPECT().Len().Return(0).AnyTimes()
 				base.EXPECT().GetTask(gomock.Any(), gomock.Any()).Return(nil, assert.AnError)
 			},
@@ -1796,7 +1813,7 @@ func TestCachedQueueReader_Prefetch(t *testing.T) {
 			name:      "clear cache, first prefetch, no tasks",
 			initLower: persistence.MinimumHistoryTaskKey,
 			initUpper: persistence.MinimumHistoryTaskKey,
-			setupMocks: func(base *MockQueueReader, queue *MockInMemQueue, _ *cachedQueueReader) {
+			setupMocks: func(base *MockQueueReader, queue *MockInMemQueue, _ *cachedScheduledQueueReader) {
 				queue.EXPECT().Len().Return(0).AnyTimes()
 				base.EXPECT().GetTask(gomock.Any(), gomock.Any()).Return(&GetTaskResponse{
 					Tasks:    nil,
@@ -1813,7 +1830,7 @@ func TestCachedQueueReader_Prefetch(t *testing.T) {
 			name:      "clear cache, first prefetch, tasks returned",
 			initLower: persistence.MinimumHistoryTaskKey,
 			initUpper: persistence.MinimumHistoryTaskKey,
-			setupMocks: func(base *MockQueueReader, queue *MockInMemQueue, _ *cachedQueueReader) {
+			setupMocks: func(base *MockQueueReader, queue *MockInMemQueue, _ *cachedScheduledQueueReader) {
 				queue.EXPECT().Len().Return(0).AnyTimes()
 				base.EXPECT().GetTask(gomock.Any(), gomock.Any()).Return(&GetTaskResponse{
 					Tasks:    []persistence.Task{t1, t2},
@@ -1832,7 +1849,7 @@ func TestCachedQueueReader_Prefetch(t *testing.T) {
 			name:      "subsequent prefetch, no tasks",
 			initLower: someLower,
 			initUpper: someUpper,
-			setupMocks: func(base *MockQueueReader, queue *MockInMemQueue, _ *cachedQueueReader) {
+			setupMocks: func(base *MockQueueReader, queue *MockInMemQueue, _ *cachedScheduledQueueReader) {
 				queue.EXPECT().Len().Return(0).AnyTimes()
 				base.EXPECT().GetTask(gomock.Any(), gomock.Any()).Return(&GetTaskResponse{
 					Tasks:    nil,
@@ -1849,7 +1866,7 @@ func TestCachedQueueReader_Prefetch(t *testing.T) {
 			name:      "subsequent prefetch, tasks returned, tasks inserted",
 			initLower: someLower,
 			initUpper: someUpper,
-			setupMocks: func(base *MockQueueReader, queue *MockInMemQueue, _ *cachedQueueReader) {
+			setupMocks: func(base *MockQueueReader, queue *MockInMemQueue, _ *cachedScheduledQueueReader) {
 				queue.EXPECT().Len().Return(0).AnyTimes()
 				base.EXPECT().GetTask(gomock.Any(), gomock.Any()).Return(&GetTaskResponse{
 					Tasks:    []persistence.Task{t3, t4},
@@ -1866,12 +1883,12 @@ func TestCachedQueueReader_Prefetch(t *testing.T) {
 		},
 		{
 			name: "subsequent prefetch, tasks returned, tasks inserted, trimmed by size",
-			optsOverride: func(o *cachedQueueReaderOptions) {
+			optsOverride: func(o *testCachedQueueReaderOptions) {
 				o.MaxSize = dynamicproperties.GetIntPropertyFn(1)
 			},
 			initLower: someLower,
 			initUpper: someUpper,
-			setupMocks: func(base *MockQueueReader, queue *MockInMemQueue, _ *cachedQueueReader) {
+			setupMocks: func(base *MockQueueReader, queue *MockInMemQueue, _ *cachedScheduledQueueReader) {
 				queue.EXPECT().Len().Return(0).AnyTimes()
 				base.EXPECT().GetTask(gomock.Any(), gomock.Any()).Return(&GetTaskResponse{
 					Tasks:    []persistence.Task{t3},
@@ -1893,7 +1910,7 @@ func TestCachedQueueReader_Prefetch(t *testing.T) {
 			name:      "gap detected: upper changed during fetch, returns error, bounds unchanged",
 			initLower: someLower,
 			initUpper: someUpper,
-			setupMocks: func(base *MockQueueReader, queue *MockInMemQueue, r *cachedQueueReader) {
+			setupMocks: func(base *MockQueueReader, queue *MockInMemQueue, r *cachedScheduledQueueReader) {
 				queue.EXPECT().Len().Return(0).AnyTimes()
 				base.EXPECT().GetTask(gomock.Any(), gomock.Any()).DoAndReturn(
 					func(_ context.Context, _ *GetTaskRequest) (*GetTaskResponse, error) {
@@ -1925,7 +1942,7 @@ func TestCachedQueueReader_Prefetch(t *testing.T) {
 				// scheduled at someUpper+1min; will fall within [someUpper, maxKey) after prefetch
 				newTask(99, someUpper.GetScheduledTime().Add(time.Minute)),
 			},
-			setupMocks: func(base *MockQueueReader, queue *MockInMemQueue, _ *cachedQueueReader) {
+			setupMocks: func(base *MockQueueReader, queue *MockInMemQueue, _ *cachedScheduledQueueReader) {
 				tBuf := newTask(99, someUpper.GetScheduledTime().Add(time.Minute))
 				queue.EXPECT().Len().Return(0).AnyTimes()
 				base.EXPECT().GetTask(gomock.Any(), gomock.Any()).Return(&GetTaskResponse{
@@ -1949,7 +1966,7 @@ func TestCachedQueueReader_Prefetch(t *testing.T) {
 			initBuffer: []persistence.Task{
 				newTask(99, someUpper.GetScheduledTime().Add(time.Minute)),
 			},
-			setupMocks: func(base *MockQueueReader, queue *MockInMemQueue, r *cachedQueueReader) {
+			setupMocks: func(base *MockQueueReader, queue *MockInMemQueue, r *cachedScheduledQueueReader) {
 				queue.EXPECT().Len().Return(0).AnyTimes()
 				base.EXPECT().GetTask(gomock.Any(), gomock.Any()).DoAndReturn(
 					func(_ context.Context, _ *GetTaskRequest) (*GetTaskResponse, error) {
@@ -1969,7 +1986,7 @@ func TestCachedQueueReader_Prefetch(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			var overrides []func(*cachedQueueReaderOptions)
+			var overrides []func(*testCachedQueueReaderOptions)
 			if tc.optsOverride != nil {
 				overrides = append(overrides, tc.optsOverride)
 			}
@@ -2027,7 +2044,7 @@ func TestCachedQueueReader_NextPrefetchDelay(t *testing.T) {
 	// 50% jitter: un-capped range would be [0.5*base, 1.5*base].
 	// The cap (min(delay, jittered)) keeps the result in [0.5*base, base],
 	// and the MinPrefetchInterval floor ensures the result is never below 1s.
-	r, deps := setupMocksForCachedQueueReader(t, ctrl, func(o *cachedQueueReaderOptions) {
+	r, deps := setupMocksForCachedQueueReader(t, ctrl, func(o *testCachedQueueReaderOptions) {
 		o.PrefetchTriggerWindow = dynamicproperties.GetDurationPropertyFn(10 * time.Minute)
 		o.MinPrefetchInterval = dynamicproperties.GetDurationPropertyFn(time.Second)
 		o.PrefetchJitterCoefficient = dynamicproperties.GetFloatPropertyFn(0.5)
