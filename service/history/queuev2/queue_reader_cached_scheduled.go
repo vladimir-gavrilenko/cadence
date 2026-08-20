@@ -73,6 +73,17 @@ type cachedScheduledQueueReader struct {
 	// prefetchOpts holds the prefetch-cycle configuration, specific to the scheduled/timer reader.
 	prefetchOpts *scheduledCachePrefetchOptions
 
+	// prefetchTargetUpper is the new exclusive upper key the current in-flight prefetch is aiming
+	// to reach. Prefetch-only state, so it lives on the scheduled reader rather than the shared
+	// base. Reset to MinimumHistoryTaskKey when no prefetch is in flight and on clearLocked.
+	prefetchTargetUpper persistence.HistoryTaskKey
+
+	// pendingInjectBuffer holds tasks that arrive via Inject while a prefetch is in-flight with
+	// keys in [exclusiveUpperBound, prefetchTargetUpper). Prefetch-only state, so it lives on the
+	// scheduled reader rather than the shared base. Drained into the cache once the prefetch
+	// completes and reset on clearLocked.
+	pendingInjectBuffer []persistence.Task
+
 	status int32 // DaemonStatusInitialized / Started / Stopped
 
 	ctx    context.Context
@@ -136,15 +147,26 @@ func newCachedScheduledQueueReaderWithOptions(
 			metricsScope,
 			options,
 		),
-		prefetchOpts: prefetchOpts,
-		status:       common.DaemonStatusInitialized,
-		prefetchCh:   make(chan struct{}, 1),
-		ctx:          ctx,
-		cancel:       cancel,
+		prefetchOpts:        prefetchOpts,
+		prefetchTargetUpper: persistence.MinimumHistoryTaskKey,
+		status:              common.DaemonStatusInitialized,
+		prefetchCh:          make(chan struct{}, 1),
+		ctx:                 ctx,
+		cancel:              cancel,
 	}
 	// Wake the prefetch loop whenever the upper bound moves so it can recompute its timer.
 	q.cachedQueueReaderBase.onUpperBoundUpdated = q.notifyPrefetch
+	// Reset the prefetch-only state whenever the shared cache is cleared.
+	q.cachedQueueReaderBase.onClearLocked = q.resetPrefetchState
 	return q
+}
+
+// resetPrefetchState clears the in-flight prefetch target and pending inject buffer. Wired as the
+// base's onClearLocked hook so a shared clearLocked also discards prefetch-only state.
+// Caller must hold q.mu (write), which clearLocked guarantees.
+func (q *cachedScheduledQueueReader) resetPrefetchState() {
+	q.pendingInjectBuffer = q.pendingInjectBuffer[:0]
+	q.prefetchTargetUpper = persistence.MinimumHistoryTaskKey
 }
 
 // Start anchors the initial eviction window and launches the background loops.
@@ -224,6 +246,48 @@ func (q *cachedScheduledQueueReader) nextPrefetchDelay() time.Duration {
 	// negative jitter on a delay already clamped to MinPrefetchInterval can otherwise
 	// return a value below it.
 	return max(q.prefetchOpts.MinPrefetchInterval(), min(delay, jittered))
+}
+
+// LookAHead returns the next task at or after req.InclusiveMinTaskKey. Serves
+// from cache when the request falls within the cached window. Bypasses
+// cache when disabled or in shadow mode. Shadow mode bypasses because in-flight
+// inject notifications make cache/DB comparison unreliable for look-ahead.
+//
+// Look-ahead is a scheduled/timer concern: only the scheduled queue's event loop calls it, to
+// learn when the next future timer fires. The immediate/transfer reader never uses cached
+// look-ahead (its wrapper delegates straight to the base reader).
+func (q *cachedScheduledQueueReader) LookAHead(ctx context.Context, req *LookAHeadRequest) (*LookAHeadResponse, error) {
+	if q.isDisabled() || q.isShadow() {
+		return q.base.LookAHead(ctx, req)
+	}
+
+	if q.fallbackIfRangeIDChanged() {
+		q.logger.Info("LookAHead falling back to base reader after rangeID change")
+		return q.base.LookAHead(ctx, req)
+	}
+
+	q.mu.RLock()
+
+	logTags := []tag.Tag{
+		tag.Dynamic("lookAHeadRequest", req),
+		tag.Dynamic("cacheState", q.getState()),
+	}
+
+	if !q.isTaskCovered(req.InclusiveMinTaskKey) {
+		q.mu.RUnlock()
+		q.logger.Debug("look-ahead cache miss", logTags...)
+		return q.base.LookAHead(ctx, req)
+	}
+
+	cacheTask := q.queue.LookAHead(req.InclusiveMinTaskKey)
+	lookAHeadMaxTime := q.exclusiveUpperBound.GetScheduledTime()
+
+	q.mu.RUnlock()
+
+	return &LookAHeadResponse{
+		Task:             cacheTask,
+		LookAheadMaxTime: lookAHeadMaxTime,
+	}, nil
 }
 
 // prefetch fetches one page of tasks into the look-ahead window. Returns nil
@@ -470,6 +534,7 @@ func (q *cachedScheduledQueueReader) Inject(tasks []persistence.Task) {
 				q.logger.Debug("buffering task",
 					tag.Dynamic("taskKey", t.GetTaskKey()),
 					tag.Dynamic("cacheState", q.getState()),
+					tag.Dynamic("prefetchTargetUpper", q.prefetchTargetUpper),
 				)
 			}
 			q.pendingInjectBuffer = append(q.pendingInjectBuffer, t)

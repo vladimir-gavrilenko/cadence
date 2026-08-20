@@ -23,6 +23,8 @@
 package queuev2
 
 import (
+	"context"
+
 	"github.com/uber/cadence/common/clock"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
@@ -83,6 +85,14 @@ func newCachedImmediateQueueReaderWithOptions(
 			options,
 		),
 	}
+}
+
+// LookAHead delegates straight to the base reader. Look-ahead is a scheduled/timer concern used by
+// the scheduled queue's event loop to find when the next future timer fires; the immediate/transfer
+// queue's event loop never calls it. This pass-through exists only to satisfy QueueReader, so the
+// transfer reader carries no cache-aware look-ahead logic of its own.
+func (q *cachedImmediateQueueReader) LookAHead(ctx context.Context, req *LookAHeadRequest) (*LookAHeadResponse, error) {
+	return q.base.LookAHead(ctx, req)
 }
 
 // Inject adds transfer tasks that have just been persisted into the in-memory cache. Because

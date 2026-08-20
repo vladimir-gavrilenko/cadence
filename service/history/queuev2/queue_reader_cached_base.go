@@ -108,16 +108,6 @@ type cachedQueueReaderBase struct {
 	// Always update via updateExclusiveUpperBound.
 	exclusiveUpperBound persistence.HistoryTaskKey
 
-	// prefetchTargetUpper is the new exclusive upper key the current in-flight prefetch
-	// is aiming to reach. Scheduled/timer reader only; stays MinimumHistoryTaskKey for the
-	// immediate/transfer reader, which has no prefetch.
-	prefetchTargetUpper persistence.HistoryTaskKey
-
-	// pendingInjectBuffer holds tasks that arrive via Inject while a prefetch is in-flight
-	// with keys in [exclusiveUpperBound, prefetchTargetUpper). Scheduled/timer reader only;
-	// stays empty for the immediate/transfer reader.
-	pendingInjectBuffer []persistence.Task
-
 	// lastRangeID is the shard rangeID observed when the cache was last valid.
 	// A change means the shard was re-acquired and the cache may be stale.
 	// Protected by mu.
@@ -134,6 +124,12 @@ type cachedQueueReaderBase struct {
 	// scheduled/timer reader wires this to notifyPrefetch so the prefetch loop recomputes its
 	// timer; the immediate/transfer reader leaves it nil (no background loop to notify).
 	onUpperBoundUpdated func()
+
+	// onClearLocked is called (under mu) at the end of clearLocked, after the shared window
+	// state has been reset. The scheduled/timer reader wires this to reset its prefetch-only
+	// state (in-flight target and pending inject buffer); the immediate/transfer reader leaves
+	// it nil (no prefetch state to reset).
+	onClearLocked func()
 }
 
 func newCachedQueueReaderBase(
@@ -155,7 +151,6 @@ func newCachedQueueReaderBase(
 		metrics:             metricsScope,
 		inclusiveLowerBound: persistence.MinimumHistoryTaskKey,
 		exclusiveUpperBound: persistence.MinimumHistoryTaskKey,
-		prefetchTargetUpper: persistence.MinimumHistoryTaskKey,
 		lastRangeID:         shard.GetRangeID(),
 	}
 }
@@ -215,10 +210,11 @@ func (q *cachedQueueReaderBase) Clear() {
 // clearLocked wipes all cached state. Caller must hold q.mu for writing.
 func (q *cachedQueueReaderBase) clearLocked() {
 	q.queue.Clear()
-	q.pendingInjectBuffer = q.pendingInjectBuffer[:0]
-	q.prefetchTargetUpper = persistence.MinimumHistoryTaskKey
 	q.updateInclusiveLowerBound(persistence.MinimumHistoryTaskKey)
 	q.updateExclusiveUpperBound(persistence.MinimumHistoryTaskKey)
+	if q.onClearLocked != nil {
+		q.onClearLocked()
+	}
 }
 
 // isRangeIDChangedLocked reports whether the shard's current rangeID differs
@@ -474,44 +470,6 @@ func (q *cachedQueueReaderBase) isPeriodicShadowSample() bool {
 	return true
 }
 
-// LookAHead returns the next task at or after req.InclusiveMinTaskKey. Serves
-// from cache when the request falls within the cached window. Bypasses
-// cache when disabled or in shadow mode. Shadow mode bypasses because in-flight
-// inject notifications make cache/DB comparison unreliable for look-ahead.
-func (q *cachedQueueReaderBase) LookAHead(ctx context.Context, req *LookAHeadRequest) (*LookAHeadResponse, error) {
-	if q.isDisabled() || q.isShadow() {
-		return q.base.LookAHead(ctx, req)
-	}
-
-	if q.fallbackIfRangeIDChanged() {
-		q.logger.Info("LookAHead falling back to base reader after rangeID change")
-		return q.base.LookAHead(ctx, req)
-	}
-
-	q.mu.RLock()
-
-	logTags := []tag.Tag{
-		tag.Dynamic("lookAHeadRequest", req),
-		tag.Dynamic("cacheState", q.getState()),
-	}
-
-	if !q.isTaskCovered(req.InclusiveMinTaskKey) {
-		q.mu.RUnlock()
-		q.logger.Debug("look-ahead cache miss", logTags...)
-		return q.base.LookAHead(ctx, req)
-	}
-
-	cacheTask := q.queue.LookAHead(req.InclusiveMinTaskKey)
-	lookAHeadMaxTime := q.exclusiveUpperBound.GetScheduledTime()
-
-	q.mu.RUnlock()
-
-	return &LookAHeadResponse{
-		Task:             cacheTask,
-		LookAheadMaxTime: lookAHeadMaxTime,
-	}, nil
-}
-
 // getState returns a snapshot of the cached queue reader's key state variables for logging and debugging.
 // Caller must hold q.mu (read or write).
 func (q *cachedQueueReaderBase) getState() cachedQueueReaderState {
@@ -519,7 +477,6 @@ func (q *cachedQueueReaderBase) getState() cachedQueueReaderState {
 		InclusiveLowerBound: q.inclusiveLowerBound,
 		ExclusiveUpperBound: q.exclusiveUpperBound,
 		CacheSize:           q.queue.Len(),
-		TargetUpperBound:    q.prefetchTargetUpper,
 	}
 }
 
@@ -528,7 +485,6 @@ type cachedQueueReaderState struct {
 	InclusiveLowerBound persistence.HistoryTaskKey `json:"inclusiveLowerBound"`
 	ExclusiveUpperBound persistence.HistoryTaskKey `json:"exclusiveUpperBound"`
 	CacheSize           int                        `json:"cacheSize"`
-	TargetUpperBound    persistence.HistoryTaskKey `json:"targetUpperBound"`
 }
 
 // getTaskInShadow queries the DB for the same request, compares the result
