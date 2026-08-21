@@ -48,7 +48,7 @@ import (
 // which struct each field now lives in.
 type testCachedQueueReaderOptions struct {
 	*cachedQueueReaderOptions
-	*scheduledCachePrefetchOptions
+	*scheduledCacheQueueReaderOptions
 }
 
 func testOptions(overrides ...func(*testCachedQueueReaderOptions)) *testCachedQueueReaderOptions {
@@ -58,7 +58,7 @@ func testOptions(overrides ...func(*testCachedQueueReaderOptions)) *testCachedQu
 			MaxSize:              dynamicproperties.GetIntPropertyFn(100),
 			ShadowSampleInterval: dynamicproperties.GetDurationPropertyFn(0),
 		},
-		scheduledCachePrefetchOptions: &scheduledCachePrefetchOptions{
+		scheduledCacheQueueReaderOptions: &scheduledCacheQueueReaderOptions{
 			MaxLookAheadWindow:        dynamicproperties.GetDurationPropertyFn(time.Hour),
 			PrefetchTriggerWindow:     dynamicproperties.GetDurationPropertyFn(5 * time.Minute),
 			PrefetchPageSize:          dynamicproperties.GetIntPropertyFn(10),
@@ -112,7 +112,7 @@ func setupMocksForCachedQueueReader(
 		testlogger.New(t),
 		metrics.NewClient(metricsScope, metrics.History, metrics.MigrationConfig{}).Scope(metrics.TimerQueueProcessorV2Scope),
 		opts.cachedQueueReaderOptions,
-		opts.scheduledCachePrefetchOptions,
+		opts.scheduledCacheQueueReaderOptions,
 	)
 
 	return r, deps
@@ -1279,7 +1279,7 @@ func TestCachedQueueReader_GetTask_PeriodicShadowSample(t *testing.T) {
 				logger,
 				metrics.NoopScope,
 				opts.cachedQueueReaderOptions,
-				opts.scheduledCachePrefetchOptions,
+				opts.scheduledCacheQueueReaderOptions,
 			)
 			setBounds(r, lower, upper)
 			deps.mockQueue.EXPECT().Len().Return(0).AnyTimes()

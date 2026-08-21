@@ -165,6 +165,9 @@ func TestCachedImmediateQueue_StartStop(t *testing.T) {
 		},
 	).AnyTimes()
 
+	mockReader.EXPECT().Start()
+	mockReader.EXPECT().Stop()
+
 	inner := newImmediateQueue(mockShard, persistence.HistoryTaskCategoryTransfer,
 		task.NewMockProcessor(ctrl), task.NewMockExecutor(ctrl),
 		mockShard.GetLogger(), metrics.NoopClient, metrics.NoopScope, mockReader, options)

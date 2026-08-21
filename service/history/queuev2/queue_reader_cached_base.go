@@ -39,9 +39,12 @@ import (
 	"github.com/uber/cadence/service/history/shard"
 )
 
-//go:generate mockgen -package $GOPACKAGE -destination queue_reader_cached_mock.go github.com/uber/cadence/service/history/queuev2 CachedQueueReader,CachedQueueReaderDaemon
+//go:generate mockgen -package $GOPACKAGE -destination queue_reader_cached_mock.go github.com/uber/cadence/service/history/queuev2 CachedQueueReader
 
-// CachedQueueReader extends QueueReader with cache injection and read-level control.
+// CachedQueueReader extends QueueReader with cache injection, read-level control, and a background
+// lifecycle. Both the scheduled (timer) and immediate (transfer) cached readers implement it; each
+// supplies its own Start/Stop. The timer reader runs a prefetch loop in a goroutine, while the
+// transfer reader only flips lifecycle state and logs, since it has no background work.
 type CachedQueueReader interface {
 	QueueReader
 	// Inject adds tasks that have just been persisted into the in-memory cache.
@@ -53,14 +56,10 @@ type CachedQueueReader interface {
 	// UpdateReadLevel advances the eviction lower bound to readLevel,
 	// dropping tasks the processor has already passed.
 	UpdateReadLevel(readLevel persistence.HistoryTaskKey)
-}
-
-// CachedQueueReaderDaemon is a CachedQueueReader with a background lifecycle. The scheduled
-// (timer) cached reader implements it because its prefetch loop runs in a goroutine; the
-// immediate (transfer) cached reader has no background work and implements only CachedQueueReader.
-type CachedQueueReaderDaemon interface {
-	CachedQueueReader
-	common.Daemon
+	// Start begins the reader's lifecycle. Idempotent.
+	Start()
+	// Stop ends the reader's lifecycle. Idempotent.
+	Stop()
 }
 
 // cachedQueueReaderOptions is the configuration shared by both cached queue readers, held by the
@@ -120,16 +119,21 @@ type cachedQueueReaderBase struct {
 	// eligible call fires immediately.
 	lastShadowSampleUnixNano atomic.Int64
 
-	// onUpperBoundUpdated is called (under mu) after exclusiveUpperBound changes. The
+	// onUpperBoundUpdatedLockedFn is called (under mu) after exclusiveUpperBound changes. The
 	// scheduled/timer reader wires this to notifyPrefetch so the prefetch loop recomputes its
 	// timer; the immediate/transfer reader leaves it nil (no background loop to notify).
-	onUpperBoundUpdated func()
+	onUpperBoundUpdatedLockedFn func()
 
-	// onClearLocked is called (under mu) at the end of clearLocked, after the shared window
+	// onClearLockedFn is called (under mu) at the end of clearLocked, after the shared window
 	// state has been reset. The scheduled/timer reader wires this to reset its prefetch-only
 	// state (in-flight target and pending inject buffer); the immediate/transfer reader leaves
 	// it nil (no prefetch state to reset).
-	onClearLocked func()
+	onClearLockedFn func()
+
+	// status holds the daemon lifecycle state (DaemonStatusInitialized / Started / Stopped).
+	// It lives on the base so both concrete readers share the same lifecycle bookkeeping; each
+	// supplies its own Start/Stop, which flip it with an atomic compare-and-swap on this field.
+	status int32
 }
 
 func newCachedQueueReaderBase(
@@ -152,6 +156,7 @@ func newCachedQueueReaderBase(
 		inclusiveLowerBound: persistence.MinimumHistoryTaskKey,
 		exclusiveUpperBound: persistence.MinimumHistoryTaskKey,
 		lastRangeID:         shard.GetRangeID(),
+		status:              common.DaemonStatusInitialized,
 	}
 }
 
@@ -212,8 +217,8 @@ func (q *cachedQueueReaderBase) clearLocked() {
 	q.queue.Clear()
 	q.updateInclusiveLowerBound(persistence.MinimumHistoryTaskKey)
 	q.updateExclusiveUpperBound(persistence.MinimumHistoryTaskKey)
-	if q.onClearLocked != nil {
-		q.onClearLocked()
+	if q.onClearLockedFn != nil {
+		q.onClearLockedFn()
 	}
 }
 
@@ -282,7 +287,7 @@ func (q *cachedQueueReaderBase) isTaskCovered(key persistence.HistoryTaskKey) bo
 	return !key.Less(q.inclusiveLowerBound) && key.Less(q.exclusiveUpperBound)
 }
 
-// updateExclusiveUpperBound sets the upper bound and runs the onUpperBoundUpdated hook if set.
+// updateExclusiveUpperBound sets the upper bound and runs the onUpperBoundUpdatedLockedFn hook if set.
 // Caller must hold q.mu.
 func (q *cachedQueueReaderBase) updateExclusiveUpperBound(newKey persistence.HistoryTaskKey) {
 	if q.logger.DebugOn() {
@@ -294,8 +299,8 @@ func (q *cachedQueueReaderBase) updateExclusiveUpperBound(newKey persistence.His
 
 	q.exclusiveUpperBound = newKey
 	q.metrics.RecordHistogramValue(metrics.CachedQueueSizeHistogram, float64(q.queue.Len()))
-	if q.onUpperBoundUpdated != nil {
-		q.onUpperBoundUpdated()
+	if q.onUpperBoundUpdatedLockedFn != nil {
+		q.onUpperBoundUpdatedLockedFn()
 	}
 }
 
@@ -374,6 +379,14 @@ func resolveInclusiveMinTaskKey(req *GetTaskRequest) (persistence.HistoryTaskKey
 		inclusiveMinTaskKey = req.Progress.NextTaskKey
 	}
 	return inclusiveMinTaskKey, true
+}
+
+// LookAHead is the default look-ahead: it delegates straight to the underlying base reader. It
+// exists on the base so cached readers without cache-aware look-ahead (the immediate/transfer
+// reader) satisfy QueueReader purely by embedding, without re-implementing it. The scheduled/timer
+// reader overrides this with a cache-aware version, since look-ahead is a scheduled concern.
+func (q *cachedQueueReaderBase) LookAHead(ctx context.Context, req *LookAHeadRequest) (*LookAHeadResponse, error) {
+	return q.base.LookAHead(ctx, req)
 }
 
 // GetTask serves tasks from the cache when the starting key is covered.

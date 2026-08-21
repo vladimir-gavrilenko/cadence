@@ -63,5 +63,12 @@ func (q *cachedImmediateQueue) NotifyNewTask(clusterName string, info *hcommon.N
 	q.immediateQueue.NotifyNewTask(clusterName, info)
 }
 
-// Start and Stop are inherited from the embedded *immediateQueue: the reader has no background
-// lifecycle of its own to drive (see CachedQueueReader vs CachedQueueReaderDaemon).
+func (q *cachedImmediateQueue) Start() {
+	q.reader.Start()
+	q.immediateQueue.Start()
+}
+
+func (q *cachedImmediateQueue) Stop() {
+	q.immediateQueue.Stop()
+	q.reader.Stop()
+}

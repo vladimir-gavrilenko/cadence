@@ -31,10 +31,10 @@ import (
 
 type cachedScheduledQueue struct {
 	*scheduledQueue
-	reader CachedQueueReaderDaemon
+	reader CachedQueueReader
 }
 
-func newCachedScheduledQueue(inner *scheduledQueue, reader CachedQueueReaderDaemon) Queue {
+func newCachedScheduledQueue(inner *scheduledQueue, reader CachedQueueReader) Queue {
 	// Wrap the queue state update to propagate min read level across all virtual queues
 	// to CachedQueueReader each time the ack level is updated
 	originalUpdateFn := inner.base.updateQueueStateFn

@@ -51,7 +51,7 @@ func TestCachedScheduledQueue_Construction(t *testing.T) {
 	)
 
 	options := testScheduledQueueOptions()
-	mockReader := NewMockCachedQueueReaderDaemon(ctrl)
+	mockReader := NewMockCachedQueueReader(ctrl)
 
 	inner := NewScheduledQueue(mockShard, persistence.HistoryTaskCategoryTimer,
 		task.NewMockProcessor(ctrl), task.NewMockExecutor(ctrl),
@@ -76,19 +76,19 @@ func TestCachedScheduledQueue_NotifyNewTask(t *testing.T) {
 	tests := []struct {
 		name            string
 		info            *hcommon.NotifyTaskInfo
-		setupMockReader func(*MockCachedQueueReaderDaemon)
+		setupMockReader func(*MockCachedQueueReader)
 	}{
 		{
 			name: "nil tasks",
 			info: &hcommon.NotifyTaskInfo{Tasks: nil},
-			setupMockReader: func(r *MockCachedQueueReaderDaemon) {
+			setupMockReader: func(r *MockCachedQueueReader) {
 				r.EXPECT().Inject([]persistence.Task(nil)).Times(1)
 			},
 		},
 		{
 			name: "with tasks",
 			info: &hcommon.NotifyTaskInfo{Tasks: tasks},
-			setupMockReader: func(r *MockCachedQueueReaderDaemon) {
+			setupMockReader: func(r *MockCachedQueueReader) {
 				r.EXPECT().Inject(tasks).Times(1)
 			},
 		},
@@ -98,7 +98,7 @@ func TestCachedScheduledQueue_NotifyNewTask(t *testing.T) {
 				Tasks:            []persistence.Task{&persistence.DecisionTimeoutTask{}},
 				PersistenceError: true,
 			},
-			setupMockReader: func(r *MockCachedQueueReaderDaemon) {
+			setupMockReader: func(r *MockCachedQueueReader) {
 				r.EXPECT().Clear().Times(1)
 			},
 		},
@@ -107,7 +107,7 @@ func TestCachedScheduledQueue_NotifyNewTask(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctrl := gomock.NewController(t)
-			mockReader := NewMockCachedQueueReaderDaemon(ctrl)
+			mockReader := NewMockCachedQueueReader(ctrl)
 			tt.setupMockReader(mockReader)
 
 			csq := &cachedScheduledQueue{
@@ -136,7 +136,7 @@ func TestCachedScheduledQueue_StartStop(t *testing.T) {
 	)
 
 	options := testScheduledQueueOptions()
-	mockReader := NewMockCachedQueueReaderDaemon(ctrl)
+	mockReader := NewMockCachedQueueReader(ctrl)
 
 	// processEventLoop calls LookAHead after the timer gate fires, and GetTask
 	// when processing new tasks. Both can fire multiple times.
@@ -175,7 +175,7 @@ func TestCachedScheduledQueue_EvictionHookWired(t *testing.T) {
 	)
 
 	options := testScheduledQueueOptions()
-	mockReader := NewMockCachedQueueReaderDaemon(ctrl)
+	mockReader := NewMockCachedQueueReader(ctrl)
 
 	inner := NewScheduledQueue(mockShard, persistence.HistoryTaskCategoryTimer,
 		task.NewMockProcessor(ctrl), task.NewMockExecutor(ctrl),
@@ -218,7 +218,7 @@ func TestCachedScheduledQueue_UpdateQueueStateFn_PropagatesReadLevel(t *testing.
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctrl := gomock.NewController(t)
-			mockReader := NewMockCachedQueueReaderDaemon(ctrl)
+			mockReader := NewMockCachedQueueReader(ctrl)
 			mockVQM := NewMockVirtualQueueManager(ctrl)
 
 			inner := &scheduledQueue{

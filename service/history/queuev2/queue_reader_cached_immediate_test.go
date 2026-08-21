@@ -27,8 +27,10 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/goleak"
 	"go.uber.org/mock/gomock"
 
+	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/clock"
 	"github.com/uber/cadence/common/dynamicconfig/dynamicproperties"
 	"github.com/uber/cadence/common/log/testlogger"
@@ -123,6 +125,21 @@ func TestCachedImmediateQueueReader_Inject_AnchorsAndExtends(t *testing.T) {
 	require.Equal(t, 4, r.queue.Len())
 }
 
+func TestCachedImmediateQueueReader_LookAHead_DelegatesToBase(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	r, mockBase := setupImmediateCachedReader(t, ctrl)
+
+	// The immediate reader has no cache-aware look-ahead of its own; it inherits the base's
+	// pass-through via embedding, so LookAHead delegates straight to the underlying reader.
+	req := &LookAHeadRequest{InclusiveMinTaskKey: immediateKey(5)}
+	want := &LookAHeadResponse{Task: transferTask(5)}
+	mockBase.EXPECT().LookAHead(gomock.Any(), req).Return(want, nil)
+
+	got, err := r.LookAHead(context.Background(), req)
+	require.NoError(t, err)
+	require.Same(t, want, got)
+}
+
 func TestCachedImmediateQueueReader_Inject_SkipsZeroTaskID(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	r, _ := setupImmediateCachedReader(t, ctrl)
@@ -211,4 +228,23 @@ func TestCachedImmediateQueueReader_Clear(t *testing.T) {
 	require.Equal(t, 0, r.queue.Len())
 	require.Equal(t, persistence.MinimumHistoryTaskKey, r.inclusiveLowerBound)
 	require.Equal(t, persistence.MinimumHistoryTaskKey, r.exclusiveUpperBound)
+}
+
+// TestCachedImmediateQueueReader_StartStop verifies the lifecycle only flips state: there is no
+// background goroutine (unlike the scheduled reader), so goleak must see nothing leak, and both
+// Start and Stop are idempotent.
+func TestCachedImmediateQueueReader_StartStop(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	ctrl := gomock.NewController(t)
+	r, _ := setupImmediateCachedReader(t, ctrl)
+
+	require.Equal(t, common.DaemonStatusInitialized, r.status)
+
+	r.Start()
+	r.Start() // idempotent
+	require.Equal(t, common.DaemonStatusStarted, r.status)
+
+	r.Stop()
+	r.Stop() // idempotent
+	require.Equal(t, common.DaemonStatusStopped, r.status)
 }

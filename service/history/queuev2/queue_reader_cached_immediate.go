@@ -23,8 +23,9 @@
 package queuev2
 
 import (
-	"context"
+	"sync/atomic"
 
+	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/clock"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
@@ -35,10 +36,11 @@ import (
 
 // cachedImmediateQueueReader is the immediate (transfer) cached queue reader. It embeds the
 // shared cachedQueueReaderBase and populates the cache purely from notification injection —
-// there is no prefetch cycle, so it has no background lifecycle and implements only
-// CachedQueueReader, not CachedQueueReaderDaemon. Unlike the timer reader, its cap guard drops
-// the OLDEST tasks (LTrimBySize) so healthy domains keep serving the newest tasks from cache
-// while a stalled domain's tasks fall through to the DB.
+// there is no prefetch cycle. It still implements the CachedQueueReader lifecycle, but its
+// Start/Stop only flip lifecycle state and emit a single log line each, since there is no
+// background loop to run. Unlike the timer reader, its cap guard drops the OLDEST tasks
+// (LTrimBySize) so healthy domains keep serving the newest tasks from cache while a stalled
+// domain's tasks fall through to the DB.
 type cachedImmediateQueueReader struct {
 	*cachedQueueReaderBase
 }
@@ -87,12 +89,25 @@ func newCachedImmediateQueueReaderWithOptions(
 	}
 }
 
-// LookAHead delegates straight to the base reader. Look-ahead is a scheduled/timer concern used by
-// the scheduled queue's event loop to find when the next future timer fires; the immediate/transfer
-// queue's event loop never calls it. This pass-through exists only to satisfy QueueReader, so the
-// transfer reader carries no cache-aware look-ahead logic of its own.
-func (q *cachedImmediateQueueReader) LookAHead(ctx context.Context, req *LookAHeadRequest) (*LookAHeadResponse, error) {
-	return q.base.LookAHead(ctx, req)
+// Start marks the reader started. Unlike the scheduled reader there is no prefetch loop to
+// launch, so this only flips lifecycle state (an atomic compare-and-swap on the base's status)
+// and logs once. There is deliberately no "starting" log: the reader is already fully operational
+// the moment it is constructed.
+func (q *cachedImmediateQueueReader) Start() {
+	if !atomic.CompareAndSwapInt32(&q.status, common.DaemonStatusInitialized, common.DaemonStatusStarted) {
+		return
+	}
+	q.logger.Info("Cached Queue Reader state changed", tag.LifeCycleStarted)
+}
+
+// Stop marks the reader stopped. There is no background goroutine to cancel or wait on, so this
+// only flips lifecycle state (an atomic compare-and-swap on the base's status) and logs once.
+// There is deliberately no "stopping" log.
+func (q *cachedImmediateQueueReader) Stop() {
+	if !atomic.CompareAndSwapInt32(&q.status, common.DaemonStatusStarted, common.DaemonStatusStopped) {
+		return
+	}
+	q.logger.Info("Cached Queue Reader state changed", tag.LifeCycleStopped)
 }
 
 // Inject adds transfer tasks that have just been persisted into the in-memory cache. Because
