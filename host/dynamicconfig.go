@@ -34,12 +34,21 @@ import (
 var (
 	// Override values for dynamic configs
 	staticOverrides = map[dynamicproperties.Key]interface{}{
-		dynamicproperties.FrontendUserRPS:                                   3000,
-		dynamicproperties.FrontendVisibilityListMaxQPS:                      200,
-		dynamicproperties.FrontendESIndexMaxResultWindow:                    defaultTestValueOfESIndexMaxResultWindow,
-		dynamicproperties.MatchingNumTasklistWritePartitions:                3,
-		dynamicproperties.MatchingNumTasklistReadPartitions:                 3,
-		dynamicproperties.TimerProcessorHistoryArchivalSizeLimit:            5 * 1024,
+		dynamicproperties.FrontendUserRPS:                        3000,
+		dynamicproperties.FrontendVisibilityListMaxQPS:           200,
+		dynamicproperties.FrontendESIndexMaxResultWindow:         defaultTestValueOfESIndexMaxResultWindow,
+		dynamicproperties.MatchingNumTasklistWritePartitions:     3,
+		dynamicproperties.MatchingNumTasklistReadPartitions:      3,
+		dynamicproperties.TimerProcessorHistoryArchivalSizeLimit: 5 * 1024,
+		// Shrink the queue processors' fallback poll intervals (defaults: timer 5m,
+		// transfer 1m). These intervals bound how long a task waits when the
+		// in-memory "new task" notification is missed/raced, which happens under CI
+		// load. With the defaults, e.g. a 1s workflow-retry backoff timer can stall
+		// until the next 5m fallback poll, blowing the per-test time limits and
+		// flaking timing-sensitive tests. 5s keeps recovery fast without hammering
+		// persistence (same values used by the replication simulation configs).
+		dynamicproperties.TimerProcessorMaxPollInterval:                     5 * time.Second,
+		dynamicproperties.TransferProcessorMaxPollInterval:                  5 * time.Second,
 		dynamicproperties.ReplicationTaskProcessorErrorRetryMaxAttempts:     1,
 		dynamicproperties.WriteVisibilityStoreName:                          constants.AdvancedVisibilityModeOff,
 		dynamicproperties.DecisionHeartbeatTimeout:                          5 * time.Second,

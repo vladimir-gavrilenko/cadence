@@ -1152,7 +1152,7 @@ func (s *IntegrationSuite) TestWorkflowRetry_SLOW() {
 	}
 }
 
-func (s *IntegrationSuite) TestWorkflowRetryFailures() {
+func (s *IntegrationSuite) TestWorkflowRetryFailures_SLOW() {
 	id := "integration-wf-retry-failures-test"
 	wt := "integration-wf-retry-failures-type"
 	tl := "integration-wf-retry-failures-tasklist"
