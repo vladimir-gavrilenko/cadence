@@ -13,3 +13,14 @@ worker.enableScheduler:
 system.minRetentionDays:
 - value: 0
   constraints: {}
+# Shrink the queue processors' fallback poll intervals (defaults: timer 5m,
+# transfer 1m). These bound how long a task waits when the in-memory "new task"
+# notification is missed/raced under CI load; with the defaults a ~1s
+# workflow-retry backoff timer can stall until the next 5m fallback poll,
+# blowing the per-test time limit and flaking timing-sensitive retry tests.
+history.timerProcessorMaxPollInterval:
+- value: "5s"
+  constraints: {}
+history.transferProcessorMaxPollInterval:
+- value: "5s"
+  constraints: {}
